@@ -45,7 +45,10 @@ namespace FORWARD
 		float4* conic_opacity,
 		const dim3 grid,
 		uint32_t* tiles_touched,
-		bool prefiltered);
+		bool prefiltered,
+		int2* rects,
+		float3 boxmin,
+		float3 boxmax);
 
 	// Main rasterization method.
 	void render(
