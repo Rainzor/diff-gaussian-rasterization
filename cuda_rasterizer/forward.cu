@@ -153,7 +153,7 @@ __device__ void computeCov3D(const glm::vec3 scale, float mod, const glm::vec4 r
 
 // Perform initial steps for each Gaussian prior to rasterization.
 template<int C>
-__global__ void preprocessCUDA(int P, int D, int M,
+__global__ void preprocessCUDA(int P, int D, int M,int DM,
 	const float* orig_points,
 	const glm::vec3* scales,
 	const float scale_modifier,
@@ -166,6 +166,10 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	const float* viewmatrix,
 	const float* projmatrix,
 	const glm::vec3* cam_pos,
+	const float* pre_viewmatrix,
+	const float* pre_projmatrix,
+	const glm::vec3* pre_cam_pos,
+	const float* tile_depth_map,
 	const int W, int H,
 	const float tan_fovx, float tan_fovy,
 	const float focal_x, float focal_y,
@@ -192,9 +196,15 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	tiles_touched[idx] = 0;
 
 	// Perform near culling, quit if outside.
+	float3 pre_p_view;
+	bool is_pre = true;
+
 	float3 p_view;
 	if (!in_frustum(idx, orig_points, viewmatrix, projmatrix, prefiltered, p_view))
 		return;
+	else
+		is_pre = in_frustum(idx, orig_points, pre_viewmatrix, pre_projmatrix, prefiltered, pre_p_view);
+	
 
 	// Transform point by projecting
 	float3 p_orig = { orig_points[3 * idx], orig_points[3 * idx + 1], orig_points[3 * idx + 2] };
@@ -256,6 +266,36 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	if ((rect_max.x - rect_min.x) * (rect_max.y - rect_min.y) == 0)
 		return;
 
+	//! Depth test: if the Gaussian is behind all depth map tiles, quit.
+	float3 pre_cov = computeCov2D(p_orig, focal_x, focal_y, tan_fovx, tan_fovy, cov3D, pre_viewmatrix);
+	float4 pre_p_hom = transformPoint4x4(p_orig, pre_projmatrix);
+	float pre_p_w = 1.0f / (pre_p_hom.w + 0.0000001f);
+	float3 pre_p_proj = { pre_p_hom.x * pre_p_w, pre_p_hom.y * pre_p_w, pre_p_hom.z * pre_p_w };
+
+	float pre_map_d = (FAR_PLANE*pre_p_view.z - FAR_PLANE*NEAR_PLANE)/((FAR_PLANE-NEAR_PLANE)*pre_p_view.z);
+	int rect_area = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
+	float2 pre_point_image = { ndc2Pix(pre_p_proj.x, W), ndc2Pix(pre_p_proj.y, H) };
+	int2 pre_my_rect = {0};
+	if(is_pre && DM>0){
+		pre_my_rect = { (int)ceil(3.f * sqrt(pre_cov.x)), (int)ceil(3.f * sqrt(pre_cov.z)) };
+		uint2 pre_rect_min, pre_rect_max;
+		getRect(pre_point_image, pre_my_rect, pre_rect_min, pre_rect_max, grid);
+		float pre_depth = FLT_MAX;
+		bool is_behind = true;
+		for (int y = pre_rect_min.y;is_behind && y < pre_rect_max.y; y++){
+			for (int x = pre_rect_min.x;is_behind && x < pre_rect_max.x; x++){
+				pre_depth = tile_depth_map[y * grid.x + x]+0.00001f;
+				is_behind = pre_map_d > pre_depth;
+			}
+		}
+		if(is_behind){
+			return;
+		}
+	}
+
+	//! ------------Depth Test End----------------
+	
+
 	// If colors have been precomputed, use them, otherwise convert
 	// spherical harmonics coefficients to RGB color.
 	if (colors_precomp == nullptr)
@@ -272,7 +312,10 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	points_xy_image[idx] = point_image;
 	// Inverse 2D covariance and opacity neatly pack into one float4
 	conic_opacity[idx] = { conic.x, conic.y, conic.z, opacities[idx] };
-	tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
+	tiles_touched[idx] = rect_area;
+	// pre_depths[idx] = pre_p_view.z;
+	// pre_rects[idx] = pre_my_rect;
+	// pre_points_xy_image[idx] = pre_point_image;
 }
 
 // Main rasterization method. Collaboratively works on one tile per
@@ -283,18 +326,21 @@ __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
 	const uint2* __restrict__ ranges,
 	const uint32_t* __restrict__ point_list,
-	int W, int H,
+	int W, int H,int DM,
 	const float2* __restrict__ points_xy_image,
+	const float* __restrict__ depths,
 	const float* __restrict__ features,
 	const float4* __restrict__ conic_opacity,
 	float* __restrict__ final_T,
 	uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ bg_color,
-	float* __restrict__ out_color)
+	float* __restrict__ out_color,
+	float* __restrict__ out_depth)
 {
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
 	uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
+	uint32_t tile_id = block.group_index().y * horizontal_blocks + block.group_index().x;
 	uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };
 	uint2 pix_max = { min(pix_min.x + BLOCK_X, W), min(pix_min.y + BLOCK_Y , H) };
 	uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
@@ -307,20 +353,26 @@ renderCUDA(
 	bool done = !inside;
 
 	// Load start/end range of IDs to process in bit sorted list.
-	uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
+	uint2 range = ranges[tile_id];
 	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
 	int toDo = range.y - range.x;
 
 	// Allocate storage for batches of collectively fetched data.
 	__shared__ int collected_id[BLOCK_SIZE];
 	__shared__ float2 collected_xy[BLOCK_SIZE];
+	__shared__ float collected_depth[BLOCK_SIZE];
+	__shared__ float depth_map[BLOCK_SIZE];
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
+	
 
 	// Initialize helper variables
 	float T = 1.0f;
 	uint32_t contributor = 0;
 	uint32_t last_contributor = 0;
 	float C[CHANNELS] = { 0 };
+	float last_dp = FLT_MAX;
+	float mid_dp = FLT_MAX;
+	float mean_dp = 0;
 
 	// Iterate over batches until all done or range is complete
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
@@ -337,6 +389,7 @@ renderCUDA(
 			int coll_id = point_list[range.x + progress];
 			collected_id[block.thread_rank()] = coll_id;
 			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
+			collected_depth[block.thread_rank()] = depths[coll_id];
 			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
 		}
 		block.sync();
@@ -350,6 +403,8 @@ renderCUDA(
 			// Resample using conic matrix (cf. "Surface 
 			// Splatting" by Zwicker et al., 2001)
 			float2 xy = collected_xy[j];
+			float depth = collected_depth[j];
+			depth = (FAR_PLANE*depth - FAR_PLANE*NEAR_PLANE)/((FAR_PLANE-NEAR_PLANE)*depth);
 			float2 d = { xy.x - pixf.x, xy.y - pixf.y };
 			float4 con_o = collected_conic_opacity[j];
 			float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
@@ -371,15 +426,24 @@ renderCUDA(
 			}
 
 			// Eq. (3) from 3D Gaussian splatting paper.
+			mean_dp += alpha * T * depth;
 			for (int ch = 0; ch < CHANNELS; ch++)
 				C[ch] += features[collected_id[j] * CHANNELS + ch] * alpha * T;
+
+			if(T>0.5f){
+				mid_dp = depth;
+			}
 
 			T = test_T;
 
 			// Keep track of last range entry to update this
 			// pixel.
 			last_contributor = contributor;
+			last_dp = depth;
 		}
+	}
+	if(last_contributor==0){
+		mean_dp = last_dp;
 	}
 
 	// All threads that treat valid pixel write out their final
@@ -391,35 +455,68 @@ renderCUDA(
 		for (int ch = 0; ch < CHANNELS; ch++)
 			out_color[ch * H * W + pix_id] = C[ch] + T * bg_color[ch];
 	}
+
+	if (inside){
+		int tid = block.thread_rank();
+		if (DM==0)
+			depth_map[tid] = FLT_MAX;
+		else if (DM==1)
+			depth_map[tid] = last_dp;
+		else if (DM==2)
+			depth_map[tid] = mid_dp;
+		else if (DM==3)
+			depth_map[tid] = mean_dp;
+		
+		__syncthreads();
+		for (int stride = BLOCK_SIZE / 2; stride > 0; stride >>= 1) {
+			if (tid < stride) {
+				depth_map[tid] = max(depth_map[tid], depth_map[tid + stride]);
+			}
+			__syncthreads();
+		}
+
+		// The first thread in the block writes the result to global memory
+		if (tid == 0) {
+			out_depth[tile_id] = depth_map[0];
+		}
+	}
 }
 
 void FORWARD::render(
 	const dim3 grid, dim3 block,
 	const uint2* ranges,
 	const uint32_t* point_list,
-	int W, int H,
+	int W, int H, int DM,
 	const float2* means2D,
+	const float* depths,
 	const float* colors,
 	const float4* conic_opacity,
 	float* final_T,
 	uint32_t* n_contrib,
 	const float* bg_color,
-	float* out_color)
-{
+	float* out_color,
+	float* out_depth
+	)
+{	
 	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
 		ranges,
 		point_list,
-		W, H,
+		W, H,DM,
 		means2D,
+		depths,
 		colors,
 		conic_opacity,
 		final_T,
 		n_contrib,
 		bg_color,
-		out_color);
+		out_color,
+		out_depth
+		);
+
+
 }
 
-void FORWARD::preprocess(int P, int D, int M,
+void FORWARD::preprocess(int P, int D, int M, int DM,
 	const float* means3D,
 	const glm::vec3* scales,
 	const float scale_modifier,
@@ -432,6 +529,10 @@ void FORWARD::preprocess(int P, int D, int M,
 	const float* viewmatrix,
 	const float* projmatrix,
 	const glm::vec3* cam_pos,
+	const float* pre_viewmatrix,
+	const float* pre_projmatrix,
+	const glm::vec3* pre_cam_pos,
+	const float* depth_map,
 	const int W, int H,
 	const float focal_x, float focal_y,
 	const float tan_fovx, float tan_fovy,
@@ -449,7 +550,7 @@ void FORWARD::preprocess(int P, int D, int M,
 	float3 boxmax)
 {
 	preprocessCUDA<NUM_CHANNELS> << <(P + 255) / 256, 256 >> > (
-		P, D, M,
+		P, D, M,DM,
 		means3D,
 		scales,
 		scale_modifier,
@@ -462,6 +563,10 @@ void FORWARD::preprocess(int P, int D, int M,
 		viewmatrix, 
 		projmatrix,
 		cam_pos,
+		pre_viewmatrix,
+		pre_projmatrix,
+		pre_cam_pos,
+		depth_map,
 		W, H,
 		tan_fovx, tan_fovy,
 		focal_x, focal_y,
@@ -478,4 +583,4 @@ void FORWARD::preprocess(int P, int D, int M,
 		boxmin,
 		boxmax
 		);
-}
+};

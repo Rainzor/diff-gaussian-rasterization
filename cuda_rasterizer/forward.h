@@ -21,7 +21,7 @@
 namespace FORWARD
 {
 	// Perform initial steps for each Gaussian prior to rasterization.
-	void preprocess(int P, int D, int M,
+	void preprocess(int P, int D, int M, int DM,
 		const float* orig_points,
 		const glm::vec3* scales,
 		const float scale_modifier,
@@ -34,6 +34,10 @@ namespace FORWARD
 		const float* viewmatrix,
 		const float* projmatrix,
 		const glm::vec3* cam_pos,
+		const float* pre_viewmatrix,
+		const float* pre_projmatrix,
+		const glm::vec3* pre_cam_pos,
+		const float* depth_map,
 		const int W, int H,
 		const float focal_x, float focal_y,
 		const float tan_fovx, float tan_fovy,
@@ -55,14 +59,16 @@ namespace FORWARD
 		const dim3 grid, dim3 block,
 		const uint2* ranges,
 		const uint32_t* point_list,
-		int W, int H,
+		int W, int H, int DM,
 		const float2* points_xy_image,
+		const float* depths,
 		const float* features,
 		const float4* conic_opacity,
 		float* final_T,
 		uint32_t* n_contrib,
 		const float* bg_color,
-		float* out_color);
+		float* out_color,
+		float* out_depth);
 }
 
 

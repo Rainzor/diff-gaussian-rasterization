@@ -203,7 +203,7 @@ int CudaRasterizer::Rasterizer::forward(
 	std::function<char* (size_t)> geometryBuffer,
 	std::function<char* (size_t)> binningBuffer,
 	std::function<char* (size_t)> imageBuffer,
-	const int P, int D, int M,
+	const int P, int D, int M, int Depth_Mod,
 	const float* background,
 	const int width, int height,
 	const float* means3D,
@@ -217,9 +217,13 @@ int CudaRasterizer::Rasterizer::forward(
 	const float* viewmatrix,
 	const float* projmatrix,
 	const float* cam_pos,
+	const float* pre_viewmatrix,
+	const float* pre_projmatrix,
+	const float* pre_cam_pos,
 	const float tan_fovx, float tan_fovy,
 	const bool prefiltered,
 	float* out_color,
+	float* tile_depth_map,
 	int* radii,
 	int* rects,
 	float* boxmin,
@@ -258,9 +262,11 @@ int CudaRasterizer::Rasterizer::forward(
 		maxx = *((float3*)boxmax);
 	}
 
+	// TODO: Generate Mipmaps for the depth map
+
 	// Run preprocessing per-Gaussian (transformation, bounding, conversion of SHs to RGB)
 	FORWARD::preprocess(
-		P, D, M,
+		P, D, M,Depth_Mod,
 		means3D,
 		(glm::vec3*)scales,
 		scale_modifier,
@@ -272,6 +278,9 @@ int CudaRasterizer::Rasterizer::forward(
 		colors_precomp,
 		viewmatrix, projmatrix,
 		(glm::vec3*)cam_pos,
+		pre_viewmatrix, pre_projmatrix,
+		(glm::vec3*)pre_cam_pos,
+		(float*)tile_depth_map,
 		width, height,
 		focal_x, focal_y,
 		tan_fovx, tan_fovy,
@@ -344,14 +353,17 @@ int CudaRasterizer::Rasterizer::forward(
 		tile_grid, block,
 		imgState.ranges,
 		binningState.point_list,
-		width, height,
+		width, height,Depth_Mod,
 		geomState.means2D,
+		geomState.depths,
 		feature_ptr,
 		geomState.conic_opacity,
 		imgState.accum_alpha,
 		imgState.n_contrib,
 		background,
-		out_color);
+		out_color,
+		(float*)tile_depth_map
+		);
 
 	return num_rendered;
 }
