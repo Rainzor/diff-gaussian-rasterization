@@ -28,7 +28,6 @@ namespace cg = cooperative_groups;
 
 #include "auxiliary.h"
 #include "forward.h"
-#include "backward.h"
 
 // Helper function to find the next-highest bit of the MSB
 // on the CPU.
@@ -47,6 +46,85 @@ uint32_t getHigherMsb(uint32_t n)
 	if (n >> msb)
 		msb++;
 	return msb;
+}
+
+void saveResultsToFile(const float* areas, int N, const char* filename) {
+    std::ofstream outFile(filename);
+    if (!outFile) {
+        std::cerr << "Failed to open file for writing: " << filename << std::endl;
+        return;
+    }
+    for (int i = 0; i < N; ++i) {
+        outFile << areas[i] << std::endl;
+    }
+    outFile.close();
+}
+
+// CUDA kernel to compute the area of 2D ellipses
+__global__ void computeEllipseAreas(int N, const float4* covMatrices, float* areas) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < N) {
+		float2 my_rect = { (3.f * sqrt(covMatrices[idx].x)), (3.f * sqrt(covMatrices[idx].z)) };
+		float det = covMatrices[idx].x * covMatrices[idx].z - covMatrices[idx].y * covMatrices[idx].y;
+        // Area of the ellipse
+        // areas[idx] = PI * 9*sqrt(det);
+		areas[idx] =my_rect.x / my_rect.y;
+    }
+}
+__global__ void mipmapKernel(float* input, float* output, int2 inputSize, int2 outputSize) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x >= outputSize.x || y >= outputSize.y)
+		return;
+	int inputX = x << 1;
+	int inputY = y << 1;
+
+    float value = input[inputY * inputSize.x + inputX];
+
+	if (inputX + 1 < inputSize.x)
+    	value = max(value, input[inputY * inputSize.x + inputX + 1]);
+
+	if (inputY + 1 < inputSize.y)
+		value = max(value, input[(inputY + 1) * inputSize.x + inputX]);
+
+	if (inputX + 1 < inputSize.x && inputY + 1 < inputSize.y)
+		value = max(value, input[(inputY + 1) * inputSize.x + inputX + 1]);
+
+    output[y * outputSize.x + x] = value;
+}
+void generateHierarchicalZBuffer(int width, int height, int start_level, int max_level, float* mipmaps) {
+	size_t offset = 0;
+	int mipmap_scale = 1;
+	int2 currentSize = { width, height };
+	int2 pastSize;
+	float* readBuffer = mipmaps;
+    float* writeBuffer = mipmaps; // 用于存储下一级mipmap
+
+	for (int level = 0; level < start_level; ++level) {
+		currentSize.x = (width + mipmap_scale - 1) / mipmap_scale;
+		currentSize.y = (height + mipmap_scale - 1) / mipmap_scale;
+		offset += currentSize.x * currentSize.y;
+		readBuffer = writeBuffer;
+		writeBuffer = mipmaps + offset;
+		mipmap_scale <<= 1;
+	}
+
+	dim3 blockSize(BLOCK_X, BLOCK_Y);
+    for (int level = start_level; level < max_level; ++level) {
+		// Swap read and write buffers
+		pastSize = currentSize;
+		currentSize.x = (width + mipmap_scale - 1) / mipmap_scale;
+		currentSize.y = (height + mipmap_scale - 1) / mipmap_scale;
+        dim3 gridSize((currentSize.x + BLOCK_X - 1) / BLOCK_X, (currentSize.y + BLOCK_Y - 1) / BLOCK_Y);
+        mipmapKernel<<<gridSize, blockSize>>>(readBuffer, writeBuffer, pastSize, currentSize);
+		// Update offset and scale for next iteration
+		offset += currentSize.x  * currentSize.y;
+		readBuffer = writeBuffer;
+		writeBuffer = mipmaps + offset;
+		mipmap_scale <<= 1;
+    }
+
 }
 
 // Wrapper method to call auxiliary coarse frustum containment test.
@@ -74,7 +152,6 @@ __global__ void duplicateWithKeys(
 	const uint32_t* offsets,
 	uint64_t* gaussian_keys_unsorted,
 	uint32_t* gaussian_values_unsorted,
-	int* radii,
 	dim3 grid,
 	int2* rects)
 {
@@ -83,16 +160,11 @@ __global__ void duplicateWithKeys(
 		return;
 
 	// Generate no key/value pair for invisible Gaussians
-	if (radii[idx] > 0)
-	{
+	if (rects[idx].x>0 && rects[idx].y>0){
 		// Find this Gaussian's offset in buffer for writing keys/values.
 		uint32_t off = (idx == 0) ? 0 : offsets[idx - 1];
 		uint2 rect_min, rect_max;
-
-		if(rects == nullptr)
-			getRect(points_xy[idx], radii[idx], rect_min, rect_max, grid);
-		else
-			getRect(points_xy[idx], rects[idx], rect_min, rect_max, grid);
+		getRect(points_xy[idx], rects[idx], rect_min, rect_max, grid);
 
 		// For each tile that the bounding rect overlaps, emit a 
 		// key/value pair. The key is |  tile ID  |      depth      |,
@@ -160,8 +232,7 @@ CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& ch
 {
 	GeometryState geom;
 	obtain(chunk, geom.depths, P, 128);
-	obtain(chunk, geom.clamped, P * 3, 128);
-	obtain(chunk, geom.internal_radii, P, 128);
+	obtain(chunk, geom.rects, P, 128);
 	obtain(chunk, geom.means2D, P, 128);
 	obtain(chunk, geom.cov3D, P * 6, 128);
 	obtain(chunk, geom.conic_opacity, P, 128);
@@ -203,7 +274,7 @@ int CudaRasterizer::Rasterizer::forward(
 	std::function<char* (size_t)> geometryBuffer,
 	std::function<char* (size_t)> binningBuffer,
 	std::function<char* (size_t)> imageBuffer,
-	const int P, int D, int M, int Depth_Mod,
+	const int P, int D, int M, int Depth_Mod, int max_level,
 	const float* background,
 	const int width, int height,
 	const float* means3D,
@@ -223,12 +294,12 @@ int CudaRasterizer::Rasterizer::forward(
 	const float tan_fovx, float tan_fovy,
 	const bool prefiltered,
 	float* out_color,
-	float* tile_depth_map,
-	int* radii,
-	int* rects,
+	float* depth_mipmap,
+	char* geom_buffer,
+	bool button,
 	float* boxmin,
 	float* boxmax)
-{
+{	
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
 
@@ -236,10 +307,10 @@ int CudaRasterizer::Rasterizer::forward(
 	char* chunkptr = geometryBuffer(chunk_size);
 	GeometryState geomState = GeometryState::fromChunk(chunkptr, P);
 
-	if (radii == nullptr)
-	{
-		radii = geomState.internal_radii;
-	}
+	// if (radii == nullptr)
+	// {
+	// 	radii = geomState.internal_radii;
+	// }
 
 	dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
 	dim3 block(BLOCK_X, BLOCK_Y, 1);
@@ -262,29 +333,28 @@ int CudaRasterizer::Rasterizer::forward(
 		maxx = *((float3*)boxmax);
 	}
 
-	// TODO: Generate Mipmaps for the depth map
+	// Generate Depth Buffer Mipmap
+	generateHierarchicalZBuffer(width, height, LEVELS, max_level, depth_mipmap);
 
 	// Run preprocessing per-Gaussian (transformation, bounding, conversion of SHs to RGB)
 	FORWARD::preprocess(
-		P, D, M,Depth_Mod,
+		P, D, M,Depth_Mod,max_level,
 		means3D,
 		(glm::vec3*)scales,
 		scale_modifier,
 		(glm::vec4*)rotations,
 		opacities,
 		shs,
-		geomState.clamped,
 		cov3D_precomp,
 		colors_precomp,
 		viewmatrix, projmatrix,
 		(glm::vec3*)cam_pos,
 		pre_viewmatrix, pre_projmatrix,
 		(glm::vec3*)pre_cam_pos,
-		(float*)tile_depth_map,
+		depth_mipmap,
 		width, height,
 		focal_x, focal_y,
 		tan_fovx, tan_fovy,
-		radii,
 		geomState.means2D,
 		geomState.depths,
 		geomState.cov3D,
@@ -293,10 +363,23 @@ int CudaRasterizer::Rasterizer::forward(
 		tile_grid,
 		geomState.tiles_touched,
 		prefiltered,
-		(int2*)rects,
+		geomState.rects,
 		minn,
 		maxx
 	);
+
+	if (button){
+		const char* filename = "D:/Program/areas.txt";
+		float* d_areas;
+		float* h_areas = new float[P]; // Output areas
+		cudaMalloc(&d_areas, P * sizeof(float));
+		computeEllipseAreas<<<(P + 255) / 256, 256>>>(P, geomState.conic_opacity, d_areas);
+		cudaMemcpy(h_areas, d_areas, P * sizeof(float), cudaMemcpyDeviceToHost);
+		saveResultsToFile(h_areas, P, filename);
+		std::cout << "Areas saved to " << filename << std::endl; 
+		delete[] h_areas;
+		cudaFree(d_areas);
+	}
 
 	// Compute prefix sum over full list of touched tile counts by Gaussians
 	// E.g., [2, 3, 0, 2, 1] -> [2, 5, 5, 7, 8]
@@ -323,9 +406,8 @@ int CudaRasterizer::Rasterizer::forward(
 		geomState.point_offsets,
 		binningState.point_list_keys_unsorted,
 		binningState.point_list_unsorted,
-		radii,
 		tile_grid,
-		(int2*)rects
+		geomState.rects
 		);
 
 	int bit = getHigherMsb(tile_grid.x * tile_grid.y);
@@ -362,105 +444,7 @@ int CudaRasterizer::Rasterizer::forward(
 		imgState.n_contrib,
 		background,
 		out_color,
-		(float*)tile_depth_map
+		(float*)depth_mipmap
 		);
-
 	return num_rendered;
-}
-
-// Produce necessary gradients for optimization, corresponding
-// to forward render pass
-void CudaRasterizer::Rasterizer::backward(
-	const int P, int D, int M, int R,
-	const float* background,
-	const int width, int height,
-	const float* means3D,
-	const float* shs,
-	const float* colors_precomp,
-	const float* scales,
-	const float scale_modifier,
-	const float* rotations,
-	const float* cov3D_precomp,
-	const float* viewmatrix,
-	const float* projmatrix,
-	const float* campos,
-	const float tan_fovx, float tan_fovy,
-	const int* radii,
-	char* geom_buffer,
-	char* binning_buffer,
-	char* img_buffer,
-	const float* dL_dpix,
-	float* dL_dmean2D,
-	float* dL_dconic,
-	float* dL_dopacity,
-	float* dL_dcolor,
-	float* dL_dmean3D,
-	float* dL_dcov3D,
-	float* dL_dsh,
-	float* dL_dscale,
-	float* dL_drot)
-{
-	GeometryState geomState = GeometryState::fromChunk(geom_buffer, P);
-	BinningState binningState = BinningState::fromChunk(binning_buffer, R);
-	ImageState imgState = ImageState::fromChunk(img_buffer, width * height);
-
-	if (radii == nullptr)
-	{
-		radii = geomState.internal_radii;
-	}
-
-	const float focal_y = height / (2.0f * tan_fovy);
-	const float focal_x = width / (2.0f * tan_fovx);
-
-	const dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
-	const dim3 block(BLOCK_X, BLOCK_Y, 1);
-
-	// Compute loss gradients w.r.t. 2D mean position, conic matrix,
-	// opacity and RGB of Gaussians from per-pixel loss gradients.
-	// If we were given precomputed colors and not SHs, use them.
-	const float* color_ptr = (colors_precomp != nullptr) ? colors_precomp : geomState.rgb;
-	BACKWARD::render(
-		tile_grid,
-		block,
-		imgState.ranges,
-		binningState.point_list,
-		width, height,
-		background,
-		geomState.means2D,
-		geomState.conic_opacity,
-		color_ptr,
-		imgState.accum_alpha,
-		imgState.n_contrib,
-		dL_dpix,
-		(float3*)dL_dmean2D,
-		(float4*)dL_dconic,
-		dL_dopacity,
-		dL_dcolor);
-
-	// Take care of the rest of preprocessing. Was the precomputed covariance
-	// given to us or a scales/rot pair? If precomputed, pass that. If not,
-	// use the one we computed ourselves.
-	const float* cov3D_ptr = (cov3D_precomp != nullptr) ? cov3D_precomp : geomState.cov3D;
-	BACKWARD::preprocess(P, D, M,
-		(float3*)means3D,
-		radii,
-		shs,
-		geomState.clamped,
-		(glm::vec3*)scales,
-		(glm::vec4*)rotations,
-		scale_modifier,
-		cov3D_ptr,
-		viewmatrix,
-		projmatrix,
-		focal_x, focal_y,
-		tan_fovx, tan_fovy,
-		(glm::vec3*)campos,
-		(float3*)dL_dmean2D,
-		dL_dconic,
-		(glm::vec3*)dL_dmean3D,
-		dL_dcolor,
-		dL_dcov3D,
-		dL_dsh,
-		(glm::vec3*)dL_dscale,
-		(glm::vec4*)dL_drot);
 }

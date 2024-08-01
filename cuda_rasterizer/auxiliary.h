@@ -21,6 +21,7 @@
 #define FAR_PLANE 1100.0f
 
 // Spherical harmonics coefficients
+#define PI 3.14159265358979323846f
 __device__ const float SH_C0 = 0.28209479177387814f;
 __device__ const float SH_C1 = 0.4886025119029199f;
 __device__ const float SH_C2[] = {
@@ -45,6 +46,7 @@ __forceinline__ __device__ float ndc2Pix(float v, int S)
 	return ((v + 1.0) * S - 1.0) * 0.5;
 }
 
+
 __forceinline__ __device__ void getRect(const float2 p, int max_radius, uint2& rect_min, uint2& rect_max, dim3 grid)
 {
 	rect_min = {
@@ -68,6 +70,18 @@ __forceinline__ __device__ void getRect(const float2 p, int2 ext_rect, uint2& re
 		min(grid.y, max((int)0, (int)((p.y + ext_rect.y + BLOCK_Y - 1) / BLOCK_Y)))
 	};
 }
+__forceinline__ __device__ void getRect(const float2 p, int2 ext_rect, uint2& rect_min, uint2& rect_max, dim3 grid, int block_size)
+{
+	rect_min = {
+		min(grid.x, max((int)0, (int)((p.x - ext_rect.x) / block_size))),
+		min(grid.y, max((int)0, (int)((p.y - ext_rect.y) / block_size)))
+	};
+	rect_max = {
+		min(grid.x, max((int)0, (int)((p.x + ext_rect.x + block_size - 1) / block_size))),
+		min(grid.y, max((int)0, (int)((p.y + ext_rect.y + block_size - 1) / block_size)))
+	};
+}
+
 
 
 __forceinline__ __device__ float3 transformPoint4x3(const float3& p, const float* matrix)

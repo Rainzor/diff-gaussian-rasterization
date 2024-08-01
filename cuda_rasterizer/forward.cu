@@ -17,7 +17,7 @@ namespace cg = cooperative_groups;
 
 // Forward method for converting the input spherical harmonics
 // coefficients of each Gaussian to a simple RGB color.
-__device__ glm::vec3 computeColorFromSH(int idx, int deg, int max_coeffs, const glm::vec3* means, glm::vec3 campos, const float* shs, bool* clamped)
+__device__ glm::vec3 computeColorFromSH(int idx, int deg, int max_coeffs, const glm::vec3* means, glm::vec3 campos, const float* shs)
 {
 	// The implementation is loosely based on code for 
 	// "Differentiable Point-Based Radiance Fields for 
@@ -61,12 +61,6 @@ __device__ glm::vec3 computeColorFromSH(int idx, int deg, int max_coeffs, const 
 		}
 	}
 	result += 0.5f;
-
-	// RGB colors are clamped to positive values. If values are
-	// clamped, we need to keep track of this for the backward pass.
-	clamped[3 * idx + 0] = (result.x < 0);
-	clamped[3 * idx + 1] = (result.y < 0);
-	clamped[3 * idx + 2] = (result.z < 0);
 	return glm::max(result, 0.0f);
 }
 
@@ -153,14 +147,13 @@ __device__ void computeCov3D(const glm::vec3 scale, float mod, const glm::vec4 r
 
 // Perform initial steps for each Gaussian prior to rasterization.
 template<int C>
-__global__ void preprocessCUDA(int P, int D, int M,int DM,
+__global__ void preprocessCUDA(int P, int D, int M,int DM,int max_level,
 	const float* orig_points,
 	const glm::vec3* scales,
 	const float scale_modifier,
 	const glm::vec4* rotations,
 	const float* opacities,
 	const float* shs,
-	bool* clamped,
 	const float* cov3D_precomp,
 	const float* colors_precomp,
 	const float* viewmatrix,
@@ -169,11 +162,10 @@ __global__ void preprocessCUDA(int P, int D, int M,int DM,
 	const float* pre_viewmatrix,
 	const float* pre_projmatrix,
 	const glm::vec3* pre_cam_pos,
-	const float* tile_depth_map,
+	const float* depth_mipmap,
 	const int W, int H,
 	const float tan_fovx, float tan_fovy,
 	const float focal_x, float focal_y,
-	int* radii,
 	float2* points_xy_image,
 	float* depths,
 	float* cov3Ds,
@@ -192,8 +184,9 @@ __global__ void preprocessCUDA(int P, int D, int M,int DM,
 
 	// Initialize radius and touched tiles to 0. If this isn't changed,
 	// this Gaussian will not be processed further.
-	radii[idx] = 0;
+	rects[idx] = { 0, 0 };
 	tiles_touched[idx] = 0;
+	conic_opacity[idx] = { 0, 0, 0, 0 };
 
 	// Perform near culling, quit if outside.
 	float3 pre_p_view;
@@ -237,6 +230,11 @@ __global__ void preprocessCUDA(int P, int D, int M,int DM,
 	float det = (cov.x * cov.z - cov.y * cov.y);
 	if (det == 0.0f)
 		return;
+	// Compute contribution of Gaussian to screen-space tiles. Quit if
+	float contribution = 9*sqrt(det)*opacities[idx];
+	if (contribution < 0.001f)
+		return;
+
 	float det_inv = 1.f / det;
 	float3 conic = { cov.z * det_inv, -cov.y * det_inv, cov.x * det_inv };
 
@@ -251,17 +249,8 @@ __global__ void preprocessCUDA(int P, int D, int M,int DM,
 	float my_radius = ceil(3.f * sqrt(max(lambda1, lambda2)));
 	float2 point_image = { ndc2Pix(p_proj.x, W), ndc2Pix(p_proj.y, H) };
 	uint2 rect_min, rect_max;
-
-	if (rects == nullptr) 	// More conservative
-	{
-		getRect(point_image, my_radius, rect_min, rect_max, grid);
-	}
-	else // Slightly more aggressive, might need a math cleanup
-	{
-		const int2 my_rect = { (int)ceil(3.f * sqrt(cov.x)), (int)ceil(3.f * sqrt(cov.z)) };
-		rects[idx] = my_rect;
-		getRect(point_image, my_rect, rect_min, rect_max, grid);
-	}
+	const int2 my_rect = { (int)ceil(3.f * sqrt(cov.x)), (int)ceil(3.f * sqrt(cov.z)) };
+	getRect(point_image, my_rect, rect_min, rect_max, grid);
 
 	if ((rect_max.x - rect_min.x) * (rect_max.y - rect_min.y) == 0)
 		return;
@@ -273,18 +262,40 @@ __global__ void preprocessCUDA(int P, int D, int M,int DM,
 	float3 pre_p_proj = { pre_p_hom.x * pre_p_w, pre_p_hom.y * pre_p_w, pre_p_hom.z * pre_p_w };
 
 	float pre_map_d = (FAR_PLANE*pre_p_view.z - FAR_PLANE*NEAR_PLANE)/((FAR_PLANE-NEAR_PLANE)*pre_p_view.z);
-	int rect_area = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
-	float2 pre_point_image = { ndc2Pix(pre_p_proj.x, W), ndc2Pix(pre_p_proj.y, H) };
-	int2 pre_my_rect = {0};
+
+
+	float2 pre_rect_f = {3.f * sqrt(pre_cov.x), 3.f * sqrt(pre_cov.z)};
+	float pre_det = (pre_cov.x * pre_cov.z - pre_cov.y * pre_cov.y);
+	float pixel_area = 9*PI*sqrt(pre_det);
+	
+	// int level = log2f(max(pre_rect_f.x, pre_rect_f.y));
+	int level = 0;
+	while(pixel_area > 4.0f){
+		level++;
+		pixel_area /= 4;
+	}
+	is_pre = is_pre && level < max_level; 
+	//int level = LEVELS - 1;
+
 	if(is_pre && DM>0){
-		pre_my_rect = { (int)ceil(3.f * sqrt(pre_cov.x)), (int)ceil(3.f * sqrt(pre_cov.z)) };
-		uint2 pre_rect_min, pre_rect_max;
-		getRect(pre_point_image, pre_my_rect, pre_rect_min, pre_rect_max, grid);
-		float pre_depth = FLT_MAX;
+		int mipmap_scale = 1 << level;
+		const int2 pre_my_rect = { (int)ceil(pre_rect_f.x), (int)ceil(pre_rect_f.y) };
+		dim3 mipmap_grid = { (W + mipmap_scale - 1) / mipmap_scale, (H + mipmap_scale - 1) / mipmap_scale, 1 };
+
+		float2 pre_point_image = { ndc2Pix(pre_p_proj.x, W), ndc2Pix(pre_p_proj.y, H) };
+		int offset = 0;
+		for (int tmp_scale = 1; tmp_scale < mipmap_scale;  tmp_scale *= 2){
+			int w = (W + tmp_scale - 1) / tmp_scale;
+			int h = (H + tmp_scale - 1) / tmp_scale;
+			offset += w * h;
+		}
+		uint2 mipmap_rect_min, mipmap_rect_max;
+		getRect(pre_point_image, pre_my_rect, mipmap_rect_min, mipmap_rect_max, mipmap_grid, mipmap_scale);
+
 		bool is_behind = true;
-		for (int y = pre_rect_min.y;is_behind && y < pre_rect_max.y; y++){
-			for (int x = pre_rect_min.x;is_behind && x < pre_rect_max.x; x++){
-				pre_depth = tile_depth_map[y * grid.x + x]+0.00001f;
+		for(int y = mipmap_rect_min.y;is_behind && y < mipmap_rect_max.y; y++){
+			for(int x = mipmap_rect_min.x;is_behind && x < mipmap_rect_max.x; x++){
+				float pre_depth = depth_mipmap[offset + y * mipmap_grid.x + x]+0.00001f;
 				is_behind = pre_map_d > pre_depth;
 			}
 		}
@@ -300,7 +311,7 @@ __global__ void preprocessCUDA(int P, int D, int M,int DM,
 	// spherical harmonics coefficients to RGB color.
 	if (colors_precomp == nullptr)
 	{
-		glm::vec3 result = computeColorFromSH(idx, D, M, (glm::vec3*)orig_points, *cam_pos, shs, clamped);
+		glm::vec3 result = computeColorFromSH(idx, D, M, (glm::vec3*)orig_points, *cam_pos, shs);
 		rgb[idx * C + 0] = result.x;
 		rgb[idx * C + 1] = result.y;
 		rgb[idx * C + 2] = result.z;
@@ -308,14 +319,11 @@ __global__ void preprocessCUDA(int P, int D, int M,int DM,
 
 	// Store some useful helper data for the next steps.
 	depths[idx] = p_view.z;
-	radii[idx] = my_radius;
+	rects[idx] = my_rect;
 	points_xy_image[idx] = point_image;
 	// Inverse 2D covariance and opacity neatly pack into one float4
 	conic_opacity[idx] = { conic.x, conic.y, conic.z, opacities[idx] };
-	tiles_touched[idx] = rect_area;
-	// pre_depths[idx] = pre_p_view.z;
-	// pre_rects[idx] = pre_my_rect;
-	// pre_points_xy_image[idx] = pre_point_image;
+	tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
 }
 
 // Main rasterization method. Collaboratively works on one tile per
@@ -361,7 +369,7 @@ renderCUDA(
 	__shared__ int collected_id[BLOCK_SIZE];
 	__shared__ float2 collected_xy[BLOCK_SIZE];
 	__shared__ float collected_depth[BLOCK_SIZE];
-	__shared__ float depth_map[BLOCK_SIZE];
+	__shared__ float shared_depth_map[BLOCK_SIZE];
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
 	
 
@@ -445,42 +453,72 @@ renderCUDA(
 	if(last_contributor==0){
 		mean_dp = last_dp;
 	}
-
+	float final_d = 1;
 	// All threads that treat valid pixel write out their final
 	// rendering data to the frame and auxiliary buffers.
-	if (inside)
-	{
+	if (inside){
+		if(DM==0)
+			final_d = FLT_MAX;
+		else if(DM==1)
+			final_d = last_dp;
+		else if(DM==2)
+			final_d = mid_dp;
+		else if(DM==3)
+			final_d = mean_dp;
 		final_T[pix_id] = T;
 		n_contrib[pix_id] = last_contributor;
 		for (int ch = 0; ch < CHANNELS; ch++)
 			out_color[ch * H * W + pix_id] = C[ch] + T * bg_color[ch];
+		out_depth[pix_id] = final_d;
 	}
 
-	if (inside){
-		int tid = block.thread_rank();
-		if (DM==0)
-			depth_map[tid] = FLT_MAX;
-		else if (DM==1)
-			depth_map[tid] = last_dp;
-		else if (DM==2)
-			depth_map[tid] = mid_dp;
-		else if (DM==3)
-			depth_map[tid] = mean_dp;
-		
-		__syncthreads();
-		for (int stride = BLOCK_SIZE / 2; stride > 0; stride >>= 1) {
-			if (tid < stride) {
-				depth_map[tid] = max(depth_map[tid], depth_map[tid + stride]);
+
+	// TODO: Implement depth mipmap
+	int tid = block.thread_rank();
+	shared_depth_map[tid] = final_d;
+	__syncthreads();
+
+	size_t offset = 0;
+	int2 curMipSize = {W, H};
+	int mipmap_scale = 1;
+	int shared_width = BLOCK_X;
+	int shared_height = BLOCK_Y;
+	int tx, ty, x_pre, y_pre;
+	float d_val = 0;
+
+	for(int level=1; level<LEVELS; level++){ // 1, 2, 3, 4
+		offset += curMipSize.x * curMipSize.y;
+		mipmap_scale <<= 1; // 2, 4, 8, 16
+		shared_width >>= 1; // 8, 4, 2, 1
+		shared_height >>= 1;
+		tx = tid % shared_width;
+		ty = tid / shared_width;
+		curMipSize.x = (W + mipmap_scale - 1) / mipmap_scale;
+		curMipSize.y = (H + mipmap_scale - 1) / mipmap_scale;
+		d_val = 0;
+		pix = { block.group_index().x * shared_width + tx, block.group_index().y * shared_height + ty };
+		pix_id = curMipSize.x * pix.y + pix.x;
+
+		if(tid < shared_width*shared_height){// 0-63, 0-15, 0-3, 0
+			x_pre = tx * 2;
+			y_pre = ty * 2;
+			d_val = shared_depth_map[y_pre * shared_width * 2 + x_pre];
+			// loop unrolling
+			d_val = max(d_val, shared_depth_map[y_pre * shared_width * 2 + x_pre + 1]);
+			d_val = max(d_val, shared_depth_map[(y_pre + 1) * shared_width * 2 + x_pre]);
+			d_val = max(d_val, shared_depth_map[(y_pre + 1) * shared_width * 2 + x_pre + 1]);
+			if(pix.x < curMipSize.x && pix.y < curMipSize.y){
+				out_depth[offset + pix_id] = d_val;
 			}
-			__syncthreads();
-		}
-
-		// The first thread in the block writes the result to global memory
-		if (tid == 0) {
-			out_depth[tile_id] = depth_map[0];
-		}
+		}		
+		__syncthreads();
+		if(tid < shared_width*shared_height)
+			shared_depth_map[tid] = d_val;
+		__syncthreads();
 	}
+	
 }
+
 
 void FORWARD::render(
 	const dim3 grid, dim3 block,
@@ -516,14 +554,13 @@ void FORWARD::render(
 
 }
 
-void FORWARD::preprocess(int P, int D, int M, int DM,
+void FORWARD::preprocess(int P, int D, int M, int DM,int max_level,
 	const float* means3D,
 	const glm::vec3* scales,
 	const float scale_modifier,
 	const glm::vec4* rotations,
 	const float* opacities,
 	const float* shs,
-	bool* clamped,
 	const float* cov3D_precomp,
 	const float* colors_precomp,
 	const float* viewmatrix,
@@ -536,7 +573,6 @@ void FORWARD::preprocess(int P, int D, int M, int DM,
 	const int W, int H,
 	const float focal_x, float focal_y,
 	const float tan_fovx, float tan_fovy,
-	int* radii,
 	float2* means2D,
 	float* depths,
 	float* cov3Ds,
@@ -550,14 +586,13 @@ void FORWARD::preprocess(int P, int D, int M, int DM,
 	float3 boxmax)
 {
 	preprocessCUDA<NUM_CHANNELS> << <(P + 255) / 256, 256 >> > (
-		P, D, M,DM,
+		P, D, M,DM,max_level,
 		means3D,
 		scales,
 		scale_modifier,
 		rotations,
 		opacities,
 		shs,
-		clamped,
 		cov3D_precomp,
 		colors_precomp,
 		viewmatrix, 
@@ -570,7 +605,6 @@ void FORWARD::preprocess(int P, int D, int M, int DM,
 		W, H,
 		tan_fovx, tan_fovy,
 		focal_x, focal_y,
-		radii,
 		means2D,
 		depths,
 		cov3Ds,
