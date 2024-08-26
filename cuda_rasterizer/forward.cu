@@ -9,7 +9,7 @@
  * For inquiries contact  george.drettakis@inria.fr
  */
 
-#include "forward.h"
+ #include "forward.h"
 #include "auxiliary.h"
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
@@ -175,6 +175,7 @@ __global__ void preprocessCUDA(int P, int D, int M,int DM,int max_level,
 	uint32_t* tiles_touched,
 	bool prefiltered,
 	int2* rects,
+	bool tile_culling,
 	float3 boxmin,
 	float3 boxmax)
 {
@@ -270,12 +271,15 @@ __global__ void preprocessCUDA(int P, int D, int M,int DM,int max_level,
 	
 	// int level = log2f(max(pre_rect_f.x, pre_rect_f.y));
 	int level = 0;
-	while(pixel_area > 4.0f){
-		level++;
-		pixel_area /= 4;
-	}
-	is_pre = is_pre && level < max_level; 
-	//int level = LEVELS - 1;
+	if(tile_culling){
+		level = LEVELS - 1;
+	}else{
+		while(pixel_area > 4.0f){
+			level++;
+			pixel_area /= 4;
+		}
+		is_pre = is_pre && level < max_level; 
+	}//int level = LEVELS - 1;
 
 	if(is_pre && DM>0){
 		int mipmap_scale = 1 << level;
@@ -582,6 +586,7 @@ void FORWARD::preprocess(int P, int D, int M, int DM,int max_level,
 	uint32_t* tiles_touched,
 	bool prefiltered,
 	int2* rects,
+	bool tile_culling,
 	float3 boxmin,
 	float3 boxmax)
 {
@@ -614,6 +619,7 @@ void FORWARD::preprocess(int P, int D, int M, int DM,int max_level,
 		tiles_touched,
 		prefiltered,
 		rects,
+		tile_culling,
 		boxmin,
 		boxmax
 		);

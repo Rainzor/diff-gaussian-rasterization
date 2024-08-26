@@ -55,6 +55,7 @@ namespace CudaRasterizer
 			float* depth_mipmap,
 			char* geom_buffer,
 			const bool button=false,
+			const bool tile_culling=false,
 			float* boxmin = nullptr,
 			float* boxmax = nullptr);
 	};

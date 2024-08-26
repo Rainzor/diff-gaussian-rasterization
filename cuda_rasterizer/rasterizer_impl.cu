@@ -9,7 +9,7 @@
  * For inquiries contact  george.drettakis@inria.fr
  */
 
-#include "rasterizer_impl.h"
+ #include "rasterizer_impl.h"
 #include <iostream>
 #include <fstream>
 #include <algorithm>
@@ -296,7 +296,8 @@ int CudaRasterizer::Rasterizer::forward(
 	float* out_color,
 	float* depth_mipmap,
 	char* geom_buffer,
-	bool button,
+	const bool button,
+	const bool tile_culling,
 	float* boxmin,
 	float* boxmax)
 {	
@@ -364,6 +365,7 @@ int CudaRasterizer::Rasterizer::forward(
 		geomState.tiles_touched,
 		prefiltered,
 		geomState.rects,
+		tile_culling,
 		minn,
 		maxx
 	);

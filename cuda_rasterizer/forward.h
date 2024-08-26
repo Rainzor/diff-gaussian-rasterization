@@ -50,6 +50,7 @@ namespace FORWARD
 		uint32_t* tiles_touched,
 		bool prefiltered,
 		int2* rects,
+		bool tile_culling,
 		float3 boxmin,
 		float3 boxmax);
 
